@@ -22,8 +22,9 @@ The pipeline consists of two main stages, of which the main scripts are stored i
 1. Extract the CSV files from GitHub by running `python scripts/file_extraction.py`.
 2. Annotate the retrieved tables by running `python scripts/table_annotation.py`.
 
-This will yield a directory with CSV files and annotated tables per topic.
-For each topic directory, you will find the raw CSV files and tables in `csv_files/` and `tables/` directories.
+This will yield a directory with CSV files and annotated tables per WordNet topic (WordNet will be downloaded automatically).
+In each topic directory, you will find the raw CSV files and tables in `csv_files/` and `tables/` directories.
+The ontologies used for the annotation are written to the `ontologies/` directory for future reference.
 
 Log files of the extraction and annotation process are written to the `logs/` directory.
 
