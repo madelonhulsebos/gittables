@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
 
 # C extensions
 *.so
@@ -110,9 +111,10 @@ ENV/
 env.bak/
 venv.bak/
 
-# Spyder project settings
+# Editor
 .spyderproject
 .spyproject
+.vscode/
 
 # Rope project settings
 .ropeproject
@@ -127,3 +129,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Project specific
+logs/extraction_logfile.log
+logs/annotation_logfile.log
+*/table_collection/
+*.bin*
