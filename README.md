@@ -25,6 +25,8 @@ The pipeline consists of two main stages, of which the main scripts are stored i
 This will yield a directory with CSV files and annotated tables per topic.
 For each topic directory, you will find the raw CSV files and tables in `csv_files/` and `tables/` directories.
 
+Log files of the extraction and annotation process are written to the `logs/` directory.
+
 **Warning**: running the code as-is might be time consuming.
 
 ## Issues and contributions
