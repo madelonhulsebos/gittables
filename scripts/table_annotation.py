@@ -25,10 +25,6 @@ if not os.path.exists(os.path.join(ontology_dir, f"schema_{ontology_date}.pickle
 with open(f"{table_collection_dir}github_topics.txt") as topic_file:
     topic_list = json.load(topic_file)
 
-topic_list = ["id"]
-
-print(f"Annotating the following topics: {topic_list}")
-
 for topic in topic_list:
     filenames_to_url = {}
     tables_dir = f"{table_collection_dir}{topic}/tables"
@@ -43,7 +39,8 @@ for topic in topic_list:
             filename_wo_extension = filename[:-4]
 
             if filename in filenames_to_url:
-                # The first one has no _number but is in count, hence -1, you would say but it was not implemented like that, so we start counting at 1.
+                # The first file has no <_number> but is in the total count (hence the '0th' file),
+                # but we start counting at 1, so the full length count can be taken for the filename.
                 filename_count = len([key for key in filenames_to_url if key.startswith(filename_wo_extension)])
                 filename = filename_wo_extension + "_" + str(filename_count) + ".csv"
             filenames_to_url[filename] = url

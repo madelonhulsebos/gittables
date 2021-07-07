@@ -66,7 +66,6 @@ class GitHubFileExtractor:
                 self._logger.info("Reading topics from existing topic list.")
                 with open(topics_filepath, "r") as topic_file:
                     topic_list = json.load(topic_file)
-                    print(type(topic_list), topic_list[:5])
                     self.topics = topic_list
                     topic_file.close()
 
@@ -101,7 +100,7 @@ class GitHubFileExtractor:
         """Extract CSV files from GitHub."""
         start = time.time()
         num_csvs = 0
-        for num_topic, topic in enumerate(self.topics[13:]):
+        for num_topic, topic in enumerate(self.topics):
             try:
                 topic_str = topic.replace(" ", "_")
                 topic_dir = f"{self.table_dir}/{topic_str}"

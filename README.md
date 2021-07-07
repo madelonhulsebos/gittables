@@ -18,17 +18,27 @@ Before running any of the code, you need to do three things:
 - Add your personal GitHub username and token to the `settings.toml` file.
 
 ## Usage
+
 The pipeline consists of two main stages, of which the main scripts are stored in `scripts/`.
-1. Extract the CSV files from GitHub by running `python scripts/file_extraction.py`.
-2. Annotate the retrieved tables by running `python scripts/table_annotation.py`.
-
-This will yield a directory with CSV files and annotated tables per WordNet topic (WordNet will be downloaded automatically).
-In each topic directory, you will find the raw CSV files and tables in `csv_files/` and `tables/` directories.
-The ontologies used for the annotation are written to the `ontologies/` directory for future reference.
-
 Log files of the extraction and annotation process are written to the `logs/` directory.
 
-**Warning**: running the code as-is might be time consuming.
+**Warning**: running the code as-is is time consuming.
+
+### Extracting CSV files
+The CSV files can be extracted by running `python scripts/file_extraction.py`.
+
+This step will use the GitHub code search API and request module to extract CSV files based on topics from WordNet (WordNet will be downloaded automatically).
+
+In each topic directory within the `table_collection` directory, you will find the raw CSV files and tables in `csv_files/`.
+
+If you want to get tables for a custom list of topics, you can modify the `file_extraction.py` script by setting the `custom_topics` argument of the `set_topics` method to a specified list of query topics, e.g. ['apple', 'pie', 'nut'].
+This list will then be used to build the table collection repository, instead of the topics from WordNet.
+
+### Parsing and annotating tables
+When the CSV files for (some of) the topics are extracted, these files can be parsed to a table and annotated with column semantics by running `python scripts/table_annotation.py`.
+
+The ontologies used for the annotation are written to the `ontologies/` directory for future reference. The ontologies used for constructing GitTables 1.7M can be downloaded from our website https://gittables.github.io.
+
 
 ## Issues and contributions
 Contributions to speed up the processes are appreciated.
