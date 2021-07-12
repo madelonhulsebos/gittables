@@ -23,6 +23,8 @@ import pyarrow.parquet as pq
 
 from scipy import spatial
 
+import utils
+
 
 class TopicTablesProcessor:
     """Process (parse, annotate and store) CSVs to tables for a topic."""
@@ -254,11 +256,14 @@ class TopicTablesProcessor:
         repository_url = url.split("blob")[0]
         owner = repository_url.split("/")[-3]
         repo = repository_url.split("/")[-2]
+
+        github_username, github_token = utils.get_github_settings(settings_filepath)
+
         try:
             response = requests.get(
                 f"https://api.github.com/repos/{owner}/{repo}/license",
                 headers={"accept": "application/vnd.github.v3+json"},
-                auth=("madelonhulsebos", "6f986ef0a3f9154c8c6ebff9040dcf08522ac5b5")
+                auth=(github_username, github_token)
             )
             if response.status_code == 200:
                 table_license = response.json()["license"]

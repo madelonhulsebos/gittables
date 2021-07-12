@@ -10,7 +10,6 @@ import os
 import shutil
 import time
 
-import dynaconf
 import nltk
 
 # pylint: disable=wrong-import-position
@@ -20,13 +19,14 @@ import numpy as np
 import requests
 from tqdm import tqdm
 
+import utils
 
 class GitHubFileExtractor:
     """File extractor class."""
 
     def __init__(self, settings_filepath: str, log_filepath: str, table_dir: str):
 
-        github_username, github_token = self._get_github_settings(settings_filepath)
+        github_username, github_token = utils.get_github_settings(settings_filepath)
 
         self.session = requests.Session()
         self.session.auth = (github_username, github_token)
@@ -137,21 +137,6 @@ class GitHubFileExtractor:
         self._logger.info(
             "Extracted CSV urls for %s topics in %s seconds", num_topic, end - start
         )
-
-    def _get_github_settings(self, settings_filepath: str):
-        """Read and return GitHub username and token.
-
-        settings_filepath
-            Filepath where github username and token can be found and loaded with dynaconf.
-        """
-        settings = dynaconf.Dynaconf(settings_files=[settings_filepath])
-
-        if not (settings.exists("github_username") and settings.exists("github_token")):
-            msg = "No username and token from GitHub were found."
-            self._logger.info(msg)
-            raise ValueError(msg)
-
-        return settings.github_username, settings.github_token
 
     def _get_raw_file_urls_from_response(self, topic: str, topic_dir: str):
         """Get relevant items from response, specifically
