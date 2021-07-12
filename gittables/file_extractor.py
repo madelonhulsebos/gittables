@@ -19,7 +19,7 @@ import numpy as np
 import requests
 from tqdm import tqdm
 
-import utils
+import gittables import utils
 
 class GitHubFileExtractor:
     """File extractor class."""

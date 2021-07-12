@@ -23,7 +23,7 @@ import pyarrow.parquet as pq
 
 from scipy import spatial
 
-import utils
+import gittables import utils
 
 
 class TopicTablesProcessor:
