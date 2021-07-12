@@ -66,7 +66,7 @@ class TopicTablesProcessor:
         ]
 
 
-    def process_topic_tables(self, filenames_to_url: typing.Dict, topic: str):
+    def process_topic_tables(self, filenames_to_url: typing.Dict, topic: str, settings_filepath: str):
         topic_table_metadata = {}
         number_parsed_tables = 0
         number_processed_tables = 0
@@ -100,7 +100,7 @@ class TopicTablesProcessor:
         new_start = start
         for i, (filename, url) in enumerate(filenames_to_url.items()):
             try:
-                table_license = self.get_table_license(url)
+                table_license = self.get_table_license(url, settings_filepath)
                 if table_license == None:
                     continue
                 table, table_metadata = self.parse_csv_file(filename, url)
@@ -247,7 +247,7 @@ class TopicTablesProcessor:
         return table, table_metadata
 
 
-    def get_table_license(self, url: str):
+    def get_table_license(self, url: str, settings_filepath: str):
         """Lookup of license associated with the repository of a CSV file.
         It will return:
         - License, if a 'named' license is found (e.g. all licenses except the 'Other' category).
@@ -284,7 +284,7 @@ class TopicTablesProcessor:
                     msg = f"Reached limit on owner {owner}, repo {repo}, waiting for {waiting_time} s"
                     self._logger.info(msg)
                     time.sleep(waiting_time)
-                    get_table_license(url)
+                    get_table_license(url, settings_filepath)
             else:
                 # In this case, we encountered another error.
                 code = response.status_code

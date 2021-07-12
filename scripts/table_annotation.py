@@ -21,6 +21,7 @@ RANDOM_STATE = 0
 ontology_date = "20210528" #datetime.date.today().strftime("%Y%m%d")
 ontology_dir = "../../ontologies/"
 logs_dir = "../logs/"
+settings_filepath = "../settings.toml"
 table_collection_dir = "../../table_collection/"
 
 
@@ -59,7 +60,7 @@ for topic in topic_list:
         continue
 
     topic_tables_annotator = table_annotator.TopicTablesProcessor(topic, logs_dir, table_collection_dir, ontology_dir, ontology_date)
-    topic_tables_metadata = topic_tables_annotator.process_topic_tables(filenames_to_url, topic)
+    topic_tables_metadata = topic_tables_annotator.process_topic_tables(filenames_to_url, topic, settings_filepath)
 
     with open(f"{table_collection_dir}{topic}/tables_licensed_metadata.json", "w+") as f:
         json.dump(topic_tables_metadata, f)
