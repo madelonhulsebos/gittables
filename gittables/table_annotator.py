@@ -35,7 +35,7 @@ class TopicTablesProcessor:
         if not os.path.exists(self.csv_dir):
             raise ValueError(f"No CSVs found for topic {topic}.")
 
-        self.table_dir = os.path.join(table_collection_dir, f"{topic}/tables")
+        self.table_dir = os.path.join(table_collection_dir, f"{topic}/tables_licensed")
         if not os.path.exists(self.table_dir):
             os.makedirs(self.table_dir)
 
@@ -47,15 +47,7 @@ class TopicTablesProcessor:
         logging.basicConfig(filename=logging_filepath, filemode="a", level=logging.INFO)
         self._logger = logging.getLogger()
 
-        fasttext_filepath = "../scripts/cc.en.300.bin"
-        if not os.path.exists(fasttext_filepath):
-            raise ValueError(
-                """
-                    The pretrained FastText model (cc.en.300.bin) should be downloaded and
-                    placed in the scripts directory.
-                """
-            )
-        self.ft_model = fasttext.load_model(fasttext_filepath)
+        self.ft_model = fasttext.load_model("../scripts/cc.en.300.bin")
         
         if not os.path.exists(ontology_dir):
             raise ValueError("Ontology directory was not detected.")
@@ -104,8 +96,11 @@ class TopicTablesProcessor:
         annotation_counts_dbpedia_embedding = collections.Counter([])
         start = time.time()
         new_start = start
-        for i, (filename, url)in enumerate(filenames_to_url.items()):
+        for i, (filename, url) in enumerate(filenames_to_url.items()):
             try:
+                table_license = self.get_table_license(url)
+                if table_license == None:
+                    continue
                 table, table_metadata = self.parse_csv_file(filename, url)
                 table_metadata = self.annotate_table(
                     list(table.columns),
@@ -113,6 +108,11 @@ class TopicTablesProcessor:
                     filename
                 )
                 number_parsed_tables += 1
+
+                table_metadata = {
+                    **table_metadata,
+                    **table_license
+                }
                 
                 table_id = self.write_table_to_parquet(
                     table,
@@ -188,7 +188,7 @@ class TopicTablesProcessor:
                     )
                     new_start = time.time()
     
-        topic_table_metadata["number_CSVs"] = i+1 # Starts counting at 1
+        topic_table_metadata["number_CSVs"] = i+1 # Start counting at 1
         topic_table_metadata["number_parsed_tables"] = number_parsed_tables
         topic_table_metadata["number_procesed_tables"] = table_id
         topic_table_metadata["row_counts"] = row_counts
@@ -243,6 +243,55 @@ class TopicTablesProcessor:
             raise e
 
         return table, table_metadata
+
+
+    def get_table_license(self, url: str):
+        """Lookup of license associated with the repository of a CSV file.
+        It will return:
+        - License, if a 'named' license is found (e.g. all licenses except the 'Other' category).
+        - None, if there is no license, an error is encountered, or the license was undetermined ('Other').
+        """
+        repository_url = url.split("blob")[0]
+        owner = repository_url.split("/")[-3]
+        repo = repository_url.split("/")[-2]
+        try:
+            response = requests.get(
+                f"https://api.github.com/repos/{owner}/{repo}/license",
+                headers={"accept": "application/vnd.github.v3+json"},
+                auth=("madelonhulsebos", "6f986ef0a3f9154c8c6ebff9040dcf08522ac5b5")
+            )
+            if response.status_code == 200:
+                table_license = response.json()["license"]
+                if table_license["name"] == "Other":
+                    table_license = None
+                else:
+                    table_license = {"license": table_license}
+            elif response.status_code == 404:
+                # In this case, the repository is not associated with a license.
+                table_license = None
+            elif response.status_code == 403:
+                # In this case, we likely reached the API limit.
+                waiting_time = float(response.headers["X-RateLimit-Reset"]) - time.time()
+                if waiting_time < 0:
+                    # We will not waiting for nothing, there was something else wrong.
+                    table_license = None
+                else:
+                    msg = f"Reached limit on owner {owner}, repo {repo}, waiting for {waiting_time} s"
+                    self._logger.info(msg)
+                    time.sleep(waiting_time)
+                    get_table_license(url)
+            else:
+                # In this case, we encountered another error.
+                code = response.status_code
+                msg = f"Ran into another issue, with status code {code}"
+                self._logger.info(msg)
+                table_license = None
+        except Exception as e:
+            msg = f"Ran into exception {e}"
+            self._logger.error(msg)
+            table_license = None
+
+        return table_license
 
 
     def annotate_table(self, table_columns: typing.List, table_metadata: typing.Dict, filename: str):
