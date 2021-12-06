@@ -14,8 +14,8 @@ These procedures were used to construct the GitTables 1.7M corpus of relational 
 Before running any of the code, you need to do three things:
 - From the root directory, install the `gittables` package using `pip install .`.
 - Install the dependencies in your environment with e.g. `pip` using `pip install -r requirements.txt`.
-- Download the proper FastText model, and make sure you have the file named `cc.en.300.bin` in the `scripts/` directory.
 - Add your personal GitHub username and token to the `settings.toml` file.
+- In case you run into issues with the FastTtext download (see `scripts/table_annotation.py`) you should download the proper FastText model yourself [here](https://fasttext.cc/docs/en/english-vectors.html) (i.e. the binary file from `crawl-300d-2M-subword.zip`). Make sure the file is (re)named to `cc.en.300.bin` and is placed in the `scripts/` directory.
 
 ## Usage
 
