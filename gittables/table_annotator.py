@@ -14,6 +14,8 @@ import time
 import traceback
 import typing
 
+import dynaconf
+import faker
 import fasttext
 import numpy as np
 import pandas as pd
@@ -23,7 +25,7 @@ import pyarrow.parquet as pq
 
 from scipy import spatial
 
-import gittables import utils
+from gittables import utils
 
 
 class TopicTablesProcessor:
@@ -49,7 +51,7 @@ class TopicTablesProcessor:
         logging.basicConfig(filename=logging_filepath, filemode="a", level=logging.INFO)
         self._logger = logging.getLogger()
 
-        self.ft_model = fasttext.load_model("../scripts/cc.en.300.bin")
+        self.ft_model = fasttext.load_model("scripts/cc.en.300.bin")
         
         if not os.path.exists(ontology_dir):
             raise ValueError("Ontology directory was not detected.")
@@ -77,25 +79,57 @@ class TopicTablesProcessor:
         dtypes_percentages = {}
         annotation_type_counts = {}
         annotation_type_similarities = {
-            "schema_embedding": {},
-            "dbpedia_embedding": {}           
+            "schema_semantic": {},
+            "dbpedia_semantic": {}           
         }
         domains = []
         domains_dict = {
-            "schema_filter": [],
-            "schema_embedding": [],
-            "dbpedia_filter": [],
-            "dbpedia_embedding": []
+            "schema_syntactic": [],
+            "schema_semantic": [],
+            "dbpedia_syntactic": [],
+            "dbpedia_semantic": []
         }
+
+        # license counts, most frequent bias values per bias type, number anonymized columns per pii type
+        fake = faker.Faker()
+        faker.Faker.seed(0)
+        # the dicts below should be mutually exclusive and not include "name"
+        dbpedia_faker_class_mapping = {
+            "address": fake.address,
+            "person": fake.name,
+            "birth date": fake.date,
+            "birth place": fake.city,
+            "postal code": fake.postcode,
+            "street": fake.street_name,
+        }
+        schema_faker_class_mapping = {
+            "email": fake.email,
+            "telephone": fake.phone_number,
+            "home location": fake.city,
+        }
+        dbpedia_bias_types = [
+            "city","country", "continent",
+            "gender", "religion",
+            "race", "skin color", "nationality", "ethnicity"
+        ]
+
+        licenses = []
+        social_media_counter = 0
+        # name is added to separate from must-fake classes, name is faked only in presence of other pii columns
+        pii_types = list(dbpedia_faker_class_mapping.keys()) + list(schema_faker_class_mapping.keys()) + ["name"]
+        pii_column_counter = {pii_type: 0 for pii_type in pii_types}
+        dbpedia_bias_type_values = {bias_type: [] for bias_type in dbpedia_bias_types}
+        dbpedia_bias_column_count = {bias_type: 0 for bias_type in dbpedia_bias_types}
+
         # number of annotated columns
-        schema_embedding_nac = []
-        schema_filter_nac = []
-        dbpedia_embedding_nac = []
-        dbpedia_filter_nac = []
-        annotation_counts_schema_filter = collections.Counter([])
-        annotation_counts_schema_embedding = collections.Counter([])
-        annotation_counts_dbpedia_filter = collections.Counter([])
-        annotation_counts_dbpedia_embedding = collections.Counter([])
+        schema_semantic_nac = []
+        schema_syntactic_nac = []
+        dbpedia_semantic_nac = []
+        dbpedia_syntactic_nac = []
+        annotation_counts_schema_syntactic = collections.Counter([])
+        annotation_counts_schema_semantic = collections.Counter([])
+        annotation_counts_dbpedia_syntactic = collections.Counter([])
+        annotation_counts_dbpedia_semantic = collections.Counter([])
         start = time.time()
         new_start = start
         for i, (filename, url) in enumerate(filenames_to_url.items()):
@@ -103,7 +137,15 @@ class TopicTablesProcessor:
                 table_license = self.get_table_license(url, settings_filepath)
                 if table_license == None:
                     continue
+                else:
+                    licenses.append(table_license["license"]["name"])
+
                 table, table_metadata = self.parse_csv_file(filename, url)
+
+                if self.flag_social_media_tables(table):
+                    social_media_counter += 1
+                    continue
+
                 table_metadata = self.annotate_table(
                     list(table.columns),
                     table_metadata,
@@ -111,11 +153,25 @@ class TopicTablesProcessor:
                 )
                 number_parsed_tables += 1
 
+                (
+                    table, table_metadata, pii_column_counter,
+                    dbpedia_bias_column_count, dbpedia_bias_type_values
+                ) = self.anonymize_bias_analysis_table(
+                    table,
+                    table_metadata,
+                    pii_column_counter,
+                    dbpedia_faker_class_mapping,
+                    schema_faker_class_mapping,
+                    dbpedia_bias_types,
+                    dbpedia_bias_column_count,
+                    dbpedia_bias_type_values,
+                )
+
                 table_metadata = {
                     **table_metadata,
                     **table_license
                 }
-                
+
                 table_id = self.write_table_to_parquet(
                     table,
                     table_metadata,
@@ -123,8 +179,7 @@ class TopicTablesProcessor:
                     # skip .csv part of filename
                     filename[:-4]
                 )
-                
-                # Only report topic metadata of tables in the collection.
+
                 row_counts.append(table.shape[0])
                 column_counts.append(table.shape[1])
                 dtypes_counter = dtypes_counter + collections.Counter(table_metadata["dtypes"].values())
@@ -141,38 +196,38 @@ class TopicTablesProcessor:
 
                 # number of annotated tables = number of non-zero annotated columns
                 # percentage annotated columns = number_of_annotated_columns / column_counts
-                schema_embedding_nac.append(len(table_metadata["schema_embedding_column_types"]))
-                schema_filter_nac.append(len(table_metadata["schema_filter_column_types"]))
-                dbpedia_embedding_nac.append(len(table_metadata["dbpedia_embedding_column_types"]))
-                dbpedia_filter_nac.append(len(table_metadata["dbpedia_filter_column_types"]))
-                
-                type_counts, annotation_type_similarities = self._get_type_counts_and_similarities(
-                    table_metadata,
-                    annotation_type_similarities,
-                    "schema_filter",
-                )
-                annotation_counts_schema_filter = annotation_counts_schema_filter + type_counts
-            
-                type_counts, annotation_type_similarities = self._get_type_counts_and_similarities(
-                    table_metadata,
-                    annotation_type_similarities,
-                    "schema_embedding",
-                )
-                annotation_counts_schema_embedding = annotation_counts_schema_embedding + type_counts
-                
-                type_counts, annotation_type_similarities = self._get_type_counts_and_similarities(
-                    table_metadata,
-                    annotation_type_similarities,
-                    "dbpedia_filter",
-                )
-                annotation_counts_dbpedia_filter = annotation_counts_dbpedia_filter + type_counts
+                schema_semantic_nac.append(len(table_metadata["schema_semantic_column_types"]))
+                schema_syntactic_nac.append(len(table_metadata["schema_syntactic_column_types"]))
+                dbpedia_semantic_nac.append(len(table_metadata["dbpedia_semantic_column_types"]))
+                dbpedia_syntactic_nac.append(len(table_metadata["dbpedia_syntactic_column_types"]))
 
                 type_counts, annotation_type_similarities = self._get_type_counts_and_similarities(
                     table_metadata,
                     annotation_type_similarities,
-                    "dbpedia_embedding",
+                    "schema_syntactic",
                 )
-                annotation_counts_dbpedia_embedding = annotation_counts_dbpedia_embedding + type_counts
+                annotation_counts_schema_syntactic = annotation_counts_schema_syntactic + type_counts
+            
+                type_counts, annotation_type_similarities = self._get_type_counts_and_similarities(
+                    table_metadata,
+                    annotation_type_similarities,
+                    "schema_semantic",
+                )
+                annotation_counts_schema_semantic = annotation_counts_schema_semantic + type_counts
+                
+                type_counts, annotation_type_similarities = self._get_type_counts_and_similarities(
+                    table_metadata,
+                    annotation_type_similarities,
+                    "dbpedia_syntactic",
+                )
+                annotation_counts_dbpedia_syntactic = annotation_counts_dbpedia_syntactic + type_counts
+
+                type_counts, annotation_type_similarities = self._get_type_counts_and_similarities(
+                    table_metadata,
+                    annotation_type_similarities,
+                    "dbpedia_semantic",
+                )
+                annotation_counts_dbpedia_semantic = annotation_counts_dbpedia_semantic + type_counts
                 
             except Exception as e:
                 tb = traceback.format_exc()
@@ -189,8 +244,19 @@ class TopicTablesProcessor:
                         """
                     )
                     new_start = time.time()
-    
+
+        for dbpedia_bias_type in dbpedia_bias_types:
+            dbpedia_bias_type_values[dbpedia_bias_type] = dict(
+                collections.Counter(dbpedia_bias_type_values[dbpedia_bias_type])
+                .most_common(100)
+            )
+
         topic_table_metadata["number_CSVs"] = i+1 # Start counting at 1
+        topic_table_metadata["licenses"] = dict(collections.Counter(licenses))
+        topic_table_metadata["removed_social_table_count"] = social_media_counter
+        topic_table_metadata["pii_column_counts"] = pii_column_counter
+        topic_table_metadata["dbpedia_bias_column_count"] = dbpedia_bias_column_count
+        topic_table_metadata["dbpedia_bias_type_values"] = dbpedia_bias_type_values
         topic_table_metadata["number_parsed_tables"] = number_parsed_tables
         topic_table_metadata["number_procesed_tables"] = table_id
         topic_table_metadata["row_counts"] = row_counts
@@ -199,23 +265,23 @@ class TopicTablesProcessor:
         topic_table_metadata["dtypes_percentages"] = dtypes_percentages
         topic_table_metadata["table_domains"] = domains_dict
         topic_table_metadata["number_of_annotated_columns"] = {
-            "schema_embedding": schema_embedding_nac,
-            "schema_filter": schema_filter_nac,
-            "dbpedia_embedding": dbpedia_embedding_nac,
-            "dbpedia_filter": dbpedia_filter_nac
+            "schema_semantic": schema_semantic_nac,
+            "schema_syntactic": schema_syntactic_nac,
+            "dbpedia_semantic": dbpedia_semantic_nac,
+            "dbpedia_syntactic": dbpedia_syntactic_nac
         }
         
         topic_table_metadata["annotation_type_counts"] = {
-            "schema_filter": dict(annotation_counts_schema_filter),
-            "schema_embedding": dict(annotation_counts_schema_embedding),
-            "dbpedia_filter": dict(annotation_counts_dbpedia_filter),
-            "dbpedia_embedding": dict(annotation_counts_dbpedia_embedding),
+            "schema_syntactic": dict(annotation_counts_schema_syntactic),
+            "schema_semantic": dict(annotation_counts_schema_semantic),
+            "dbpedia_syntactic": dict(annotation_counts_dbpedia_syntactic),
+            "dbpedia_semantic": dict(annotation_counts_dbpedia_semantic),
         }
         topic_table_metadata["annotation_type_similarities"] = annotation_type_similarities
         topic_table_metadata["annotation_runtime"] = time.time() - start
         
         return topic_table_metadata
-    
+
     
     def parse_csv_file(self, filename: str, url: str):
         try:
@@ -250,7 +316,7 @@ class TopicTablesProcessor:
     def get_table_license(self, url: str, settings_filepath: str):
         """Lookup of license associated with the repository of a CSV file.
         It will return:
-        - License, if a 'named' license is found (e.g. all licenses except the 'Other' category).
+        - License metadata ('license': '<license name>'), if a 'named' license is found (e.g. all licenses except the 'Other' category).
         - None, if there is no license, an error is encountered, or the license was undetermined ('Other').
         """
         repository_url = url.split("blob")[0]
@@ -258,6 +324,10 @@ class TopicTablesProcessor:
         repo = repository_url.split("/")[-2]
 
         github_username, github_token = utils.get_github_settings(settings_filepath)
+
+        # For a second annotation process; using a second github token.
+        # github_token = dynaconf.Dynaconf(settings_files=[settings_filepath]).github_token_extra
+        # github_username = dynaconf.Dynaconf(settings_files=[settings_filepath]).github_username_extra
 
         try:
             response = requests.get(
@@ -284,7 +354,7 @@ class TopicTablesProcessor:
                     msg = f"Reached limit on owner {owner}, repo {repo}, waiting for {waiting_time} s"
                     self._logger.info(msg)
                     time.sleep(waiting_time)
-                    get_table_license(url, settings_filepath)
+                    self.get_table_license(url, settings_filepath)
             else:
                 # In this case, we encountered another error.
                 code = response.status_code
@@ -298,20 +368,43 @@ class TopicTablesProcessor:
 
         return table_license
 
+    def flag_social_media_tables(self, table: pd.DataFrame) -> bool:
+        """
+        Flag tables potentially containing data from social media platforms.
+        This is detected by checking if there 
+        These tables are not in scope for GitTables at this moment.
+
+        Returns
+        -------
+        social_flag
+            Boolean variable being set to True in case social media is
+            detected in the input table, else False.
+        """
+        social_platform_prefixes = ["twitter", "tweet", "facebook", "reddit"]
+        column_names = table.columns
+        social_columns = column_names[column_names.str.contains('|'.join(social_platform_prefixes))]
+        if list(social_columns):
+            social_flag = True
+        else:
+            # No social media platform data expected in table
+            social_flag = False
+
+        return social_flag
+
 
     def annotate_table(self, table_columns: typing.List, table_metadata: typing.Dict, filename: str):
         try:
-            filter_annotation_dict = self.filter_annotate_table(table_columns)
-            fasttext_annotation_dict = self.fasttext_annotate_table(table_columns)
+            syntactic_annotation_dict = self.syntactic_annotate_table(table_columns)
+            semantic_annotation_dict = self.semantic_annotate_table(table_columns)
 
             table_metadata = {
                 **table_metadata,
-                **filter_annotation_dict,
-                **fasttext_annotation_dict,
+                **syntactic_annotation_dict,
+                **semantic_annotation_dict,
             }
 
             table_metadata["table_domain"] = {}
-            for annotation_type in ["schema_filter", "schema_embedding", "dbpedia_filter", "dbpedia_embedding"]:
+            for annotation_type in ["schema_syntactic", "schema_semantic", "dbpedia_syntactic", "dbpedia_semantic"]:
                 table_metadata["table_domain"][annotation_type] = self._classify_table_domain(
                     table_metadata
                     .copy()
@@ -323,8 +416,84 @@ class TopicTablesProcessor:
             self._logger.error(msg)
             self._logger.error(table_metadata)
             raise e
-        
+
         return table_metadata
+
+
+    def anonymize_bias_analysis_table(
+        self,
+        table: pd.DataFrame,
+        table_metadata: typing.Dict,
+        pii_column_counter: typing.Dict,
+        dbpedia_faker_class_mapping: typing.Dict,
+        schema_faker_class_mapping: typing.Dict,
+        dbpedia_bias_types: typing.Dict,
+        dbpedia_bias_column_count: typing.Dict,
+        dbpedia_bias_type_values: typing.Dict,
+    ):
+
+        column_names = table.columns
+        anonymized_columns = []
+        dbpedia_column_types = {
+            col: table_metadata["dbpedia_semantic_column_types"][col]["cleaned_label"]
+            for col in
+            table_metadata["dbpedia_semantic_column_types"]
+        }
+        schema_column_types = {
+            col: table_metadata["schema_semantic_column_types"][col]["cleaned_label"]
+            for col in
+            table_metadata["schema_semantic_column_types"]
+        }
+        for col in column_names:
+
+            if not col in dbpedia_column_types and not col in schema_column_types:
+                # No annotation for this column
+                continue
+
+            dbpedia_type = None
+            schema_type = None
+            # We do not have annotations for every column
+            if col in dbpedia_column_types:
+                dbpedia_type = dbpedia_column_types[col]
+            if col in schema_column_types:
+                schema_type = schema_column_types[col]
+
+            if dbpedia_type in dbpedia_faker_class_mapping:
+                anonymized_columns.append(col)
+                # Faster then pandas df update
+                values = [dbpedia_faker_class_mapping[dbpedia_type]() for i in range(0, table.shape[0])]
+                table[col] = values
+                pii_column_counter[dbpedia_type] += 1
+            elif schema_type in schema_faker_class_mapping:
+                anonymized_columns.append(col)
+                values = [schema_faker_class_mapping[schema_type]() for i in range(0, table.shape[0])]
+                table[col] = values
+                pii_column_counter[schema_type] += 1
+            # Generate fake names *only* in presence of any other pii column
+            # Otherwise, the name could be of anything (from a medicine to company name)
+
+            if dbpedia_type == "name" or schema_type == "name":
+                # Check if any other annotation in the table is a pii type
+                if any(
+                    col_type in
+                    list(dbpedia_faker_class_mapping.keys()) + list(schema_faker_class_mapping.keys())
+                    for col_type in
+                    list(set(list(dbpedia_column_types.values()) + list(schema_column_types.values())))
+                ):  
+                    fake = faker.Faker()
+                    faker.Faker.seed(0)
+                    anonymized_columns.append(col)
+                    values = [fake.name() for i in range(0, table.shape[0])]
+                    table[col] = values
+                    pii_column_counter["name"] += 1
+            
+            if dbpedia_type in dbpedia_bias_types:
+                dbpedia_bias_column_count[dbpedia_type] += 1
+                dbpedia_bias_type_values[dbpedia_type] += table[col].tolist()
+
+        table_metadata["anonymized_columns"] = anonymized_columns
+ 
+        return table, table_metadata, pii_column_counter, dbpedia_bias_column_count, dbpedia_bias_type_values
 
 
     def write_table_to_parquet(
@@ -382,7 +551,7 @@ class TopicTablesProcessor:
         return table_id
 
 
-    def filter_annotate_table(self, table_columns: typing.List) -> typing.Dict:
+    def syntactic_annotate_table(self, table_columns: typing.List) -> typing.Dict:
 
         cleaned_table_columns = [
             re.sub(r"[_-]"," ", " ".join(
@@ -434,7 +603,7 @@ class TopicTablesProcessor:
         original_annotated_columns = [table_columns[index] for index in annotated_columns_indices]
 
         annotation_dict = {
-            f"{ontology_name}_filter_column_types": {},
+            f"{ontology_name}_syntactic_column_types": {},
         }        
         
         if len(annotated_columns) != len(original_annotated_columns):
@@ -448,7 +617,7 @@ class TopicTablesProcessor:
             return annotation_dict
 
         for i, col in enumerate(original_annotated_columns):
-            annotation_dict[f"{ontology_name}_filter_column_types"][col] = (
+            annotation_dict[f"{ontology_name}_syntactic_column_types"][col] = (
                 ontology_dict[annotated_columns[i]]
             )
 
@@ -456,7 +625,7 @@ class TopicTablesProcessor:
 
     
     
-    def fasttext_annotate_table(self, table_columns: typing.List) -> typing.Dict:
+    def semantic_annotate_table(self, table_columns: typing.List) -> typing.Dict:
         """Annotate table columns with FastText for dbpedia and schema types."""
         try:
             table_columns = [col for col in table_columns.copy() if not col.startswith("Unnamed:") and not any(char.isdigit() for char in col)]
@@ -492,10 +661,10 @@ class TopicTablesProcessor:
             self._logger.error(f"Encountered error on fasttext embedding: {e}")
             # If an error is encountered, the annotations are empty.
             return {
-                f"dbpedia_embedding_column_types": {},
-                f"schema_embedding_column_types": {},
-                f"dbpedia_embedding_similarities": {},
-                f"schema_embedding_similarities": {},
+                f"dbpedia_semantic_column_types": {},
+                f"schema_semantic_column_types": {},
+                f"dbpedia_semantic_similarities": {},
+                f"schema_semantic_similarities": {},
             }
 
     def _get_type_counts_and_similarities(
@@ -543,7 +712,7 @@ class TopicTablesProcessor:
             Dictionary holding the annotation for each original column.
             An example for a table annotated with the schema ontology:
             {
-                "schema_embedding_column_types": {
+                "schema_semantic_column_types": {
                     "StreetName": {
                         <schema annotation dictionary with type info>
                     },
@@ -554,7 +723,7 @@ class TopicTablesProcessor:
             }
         """
         similarities = pd.DataFrame(
-            self._get_embedding_similarities(header_embeddings, ontology_embeddings)
+            self._get_semantic_similarities(header_embeddings, ontology_embeddings)
         )
         similarities.index = table_columns
         similarities.columns = ontology_types
@@ -577,22 +746,22 @@ class TopicTablesProcessor:
         ]
 
         annotation_dict = {
-            f"{ontology_name}_embedding_column_types": {},
-            f"{ontology_name}_embedding_similarities": {},
+            f"{ontology_name}_semantic_column_types": {},
+            f"{ontology_name}_semantic_similarities": {},
         }
 
         for i, col in enumerate(original_annotated_columns):
-            annotation_dict[f"{ontology_name}_embedding_column_types"][col] = (
+            annotation_dict[f"{ontology_name}_semantic_column_types"][col] = (
                 ontology_dict[annotated_columns[i]]
             )
-            annotation_dict[f"{ontology_name}_embedding_similarities"][col] = (
+            annotation_dict[f"{ontology_name}_semantic_similarities"][col] = (
                 np.round(annotation_similarities[i], 4)
             )
         
         return annotation_dict
 
 
-    def _get_embedding_similarities(self, header_embeddings: list, ontology_embeddings: list):
+    def _get_semantic_similarities(self, header_embeddings: list, ontology_embeddings: list):
         """Preprocess and calculate similarity between two lists of header vectors."""
 
         cosine_distances = spatial.distance.cdist(header_embeddings, ontology_embeddings, "cosine")

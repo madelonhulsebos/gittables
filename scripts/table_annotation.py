@@ -12,6 +12,21 @@ from fasttext.util import util
 from gittables import ontology
 from gittables import table_annotator
 
+
+def _sample_urls(urls: typing.List, max_sample_size: int):
+    if len(urls) > max_sample_size:
+        random.seed(RANDOM_STATE)
+        sample_urls = random.sample(np.arange(0, len(urls)).tolist(), k=max_sample_size)
+
+        table_url_sample = [urls[i] for i in sample_urls]
+    else:
+        table_url_sample = urls
+
+    print(f"Number urls sampled: {len(table_url_sample)}")
+
+    return table_url_sample
+
+
 # TODO: this function is not available from the pypi version of fasttext.
 # The package needs to be downloaded from the github repository.
 util.download_model('en', if_exists='ignore')
@@ -19,11 +34,10 @@ util.download_model('en', if_exists='ignore')
 RANDOM_STATE = 0
 
 ontology_date = "20210528" #datetime.date.today().strftime("%Y%m%d")
-ontology_dir = "../../ontologies/"
-logs_dir = "../logs/"
-settings_filepath = "../settings.toml"
-table_collection_dir = "../../table_collection/"
-
+ontology_dir = "ontologies/"
+logs_dir = "logs/"
+settings_filepath = "settings.toml"
+table_collection_dir = "table_collection/"
 
 if not os.path.exists(os.path.join(ontology_dir, f"schema_{ontology_date}.pickle")):
     ontology.build_schema_ontology(ontology_dir)
@@ -36,9 +50,11 @@ print(f"Annotating the following topics: {topic_list}")
 
 for topic in topic_list:
     filenames_to_url = {}
+    
     tables_dir = f"{table_collection_dir}{topic}/tables_licensed"
     if os.path.exists(tables_dir):
-        shutil.rmtree(tables_dir)
+        continue
+        #shutil.rmtree(tables_dir)
     if not os.path.exists(f"{table_collection_dir}{topic}/topic_csv_urls.txt"):
         continue
     with open(f"{table_collection_dir}{topic}/topic_csv_urls.txt") as f:

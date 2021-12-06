@@ -19,7 +19,7 @@ import numpy as np
 import requests
 from tqdm import tqdm
 
-import gittables import utils
+from gittables import utils
 
 class GitHubFileExtractor:
     """File extractor class."""
@@ -100,7 +100,8 @@ class GitHubFileExtractor:
         """Extract CSV files from GitHub."""
         start = time.time()
         num_csvs = 0
-        for num_topic, topic in enumerate(self.topics):
+        # The GitTables token starts at end of topic list to avoid conflict
+        for num_topic, topic in enumerate(self.topics[::-1]):
             try:
                 topic_str = topic.replace(" ", "_")
                 topic_dir = f"{self.table_dir}/{topic_str}"
