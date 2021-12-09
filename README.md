@@ -22,7 +22,7 @@ Before running any of the code, a few steps need to be executed:
 The pipeline consists of two main stages, of which the main scripts are stored in `scripts/`, run these scripts from the root directory.
 Log files of the extraction and annotation process are written to the `logs/` directory.
 
-**Warning**: running the code as-is is time consuming.
+**Warning**: running the code as-is is time consuming as it builds many queries for extracting many files.
 
 ### Extracting CSV files
 The CSV files can be extracted by running `python scripts/file_extraction.py`.
