@@ -354,7 +354,7 @@ class TopicTablesProcessor:
                     msg = f"Reached limit on owner {owner}, repo {repo}, waiting for {waiting_time} s"
                     self._logger.info(msg)
                     time.sleep(waiting_time)
-                    self.get_table_license(url, settings_filepath)
+                    table_license = self.get_table_license(url, settings_filepath)
             else:
                 # In this case, we encountered another error.
                 code = response.status_code
