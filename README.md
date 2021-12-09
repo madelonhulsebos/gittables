@@ -11,7 +11,7 @@ The code in this repository resemble the procedures for:
 These procedures were used to construct the GitTables 1.7M corpus of relational tables, which you can find [on Zenodo here](https://zenodo.org/record/4943312). The go-to for more information about the GitTables project or contact details, please visit [our website](https://gittables.github.io). The GitTables paper can be retrieved [here](https://arxiv.org/abs/2106.07258).
 
 ## Installation
-Before running any of the code, you need to do three things:
+Before running any of the code, a few steps need to be executed:
 - From the root directory, install the `gittables` package using `pip install .`.
 - Install the dependencies in your environment with e.g. `pip` using `pip install -r requirements.txt`.
 - Add your personal GitHub username and token to the `settings.toml` file.
