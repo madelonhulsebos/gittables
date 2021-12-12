@@ -1,6 +1,5 @@
 # GitTables
-Code for extracting, parsing and annotating tables from **GitTables** (https://gittables.github.io).
-
+Code for extracting, parsing and annotating tables from **GitTables** (https://gittables.github.io), a corpus of 1.7M tables extracted from GitHub.
 
 ## Quick links
 
