@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: "Hulsebos"
+  given-names: "Madelon"
+- family-names: "Demiralp"
+  given-names: "Çağatay"
+- family-names: "Groth"
+  given-names: "Paul"
+title: "GitTables"
+version: 0.0.1
+url: "https://github.com/madelonhulsebos/gittables"
