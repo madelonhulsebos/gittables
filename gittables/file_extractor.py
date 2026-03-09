@@ -1,14 +1,21 @@
 """
 This module facilitates the extraction of CSV files from GitHub.
 All nouns from WordNet are used to build queries.
+
+Modifications:
+- Filters repositories by research-friendly licenses (MIT, Apache 2.0, CC-BY, etc.)
+- Filters OUT CSV files that appear to be LLM/NLP datasets (tokens, n-grams, embeddings, etc.)
 """
 
+import csv
 import glob
+import io
 import json
 import logging
 import os
 import shutil
 import time
+from typing import Dict, Optional
 
 import nltk
 
@@ -21,11 +28,149 @@ from tqdm import tqdm
 
 from gittables import utils
 
+
+# ── License & column filter config ────────────────────────────────────────────
+
+# SPDX identifiers accepted for research use.
+# Extend or restrict this list to match your institution's policy.
+RESEARCH_FRIENDLY_LICENSES = {
+    "mit",
+    "apache-2.0",
+    "gpl-2.0",
+    "gpl-3.0",
+    "lgpl-2.1",
+    "lgpl-3.0",
+    "bsd-2-clause",
+    "bsd-3-clause",
+    "cc-by-4.0",
+    "cc-by-sa-4.0",
+    "cc0-1.0",
+    "isc",
+    "mpl-2.0",
+    "eupl-1.2",
+    "agpl-3.0",
+}
+
+# Column name fragments that suggest an LLM / NLP dataset.
+# A CSV whose header contains ANY of these substrings (case-insensitive) is skipped.
+LLM_COLUMN_KEYWORDS = {
+    "token",
+    "ngram",
+    "n_gram",
+    "n-gram",
+    "unigram",
+    "bigram",
+    "trigram",
+    "embedding",
+    "vector",
+    "logit",
+    "perplexity",
+    "vocab",
+    "vocabulary",
+    "bpe",
+    "subword",
+    "wordpiece",
+    "sentencepiece",
+    "attention",
+    "transformer",
+    "bert",
+    "gpt",
+    "llm",
+    "prompt",
+    "completion",
+    "fine_tun",      # covers fine_tune, fine_tuning
+    "finetun",
+    "pretrain",
+    "pre_train",
+    "language_model",
+    "corpus_id",
+    "doc_freq",
+    "term_freq",
+    "tf_idf",
+    "tfidf",
+    "word_freq",
+    "pos_tag",
+    "ner_tag",
+    "lemma",
+    "stem",
+    "topic_id"
+}
+
+
+def _is_llm_csv(raw_content: bytes, sample_rows: int = 3) -> bool:
+    """Return True if the CSV looks like an LLM / NLP dataset.
+
+    Checks are performed on:
+    1. Column headers — any LLM_COLUMN_KEYWORDS substring match triggers rejection.
+    2. First `sample_rows` data rows — rejects if values look like space-separated
+       token sequences (heuristic: avg words-per-cell > 6 in a text column).
+
+    Parameters
+    ----------
+    raw_content
+        Raw bytes of the downloaded CSV.
+    sample_rows
+        Number of data rows to inspect beyond the header.
+    """
+    try:
+        text = raw_content.decode("utf-8", errors="replace")
+        reader = csv.reader(io.StringIO(text))
+        rows = []
+        for i, row in enumerate(reader):
+            rows.append(row)
+            if i > sample_rows:
+                break
+
+        if not rows:
+            return False
+
+        header = [col.strip().lower() for col in rows[0]]
+
+        # 1. Header keyword check
+        for col in header:
+            for kw in LLM_COLUMN_KEYWORDS:
+                if kw in col:
+                    return True
+
+        # 2. Heuristic: a column whose cells look like token sequences
+        if len(rows) > 1:
+            data_rows = rows[1:]
+            for col_idx in range(len(header)):
+                values = []
+                for row in data_rows:
+                    if col_idx < len(row):
+                        values.append(row[col_idx].strip())
+                if not values:
+                    continue
+                avg_words = np.mean([len(v.split()) for v in values if v])
+                if avg_words > 6:
+                    return True
+
+    except Exception:
+        # If we can't parse it, don't reject it on suspicion alone
+        pass
+
+    return False
+
+
+# ── Main extractor ─────────────────────────────────────────────────────────────
+
 class GitHubFileExtractor:
-    """File extractor class."""
+    """File extractor class.
 
-    def __init__(self, settings_filepath: str, log_filepath: str, table_dir: str):
+    Two new keyword arguments compared to the original:
+    - filter_license : bool  (default True)  — skip repos without a research-friendly license
+    - filter_llm_cols: bool  (default True)  — skip CSVs that look like LLM/NLP datasets
+    """
 
+    def __init__(
+        self,
+        settings_filepath: str,
+        log_filepath: str,
+        table_dir: str,
+        filter_license: bool = True,
+        filter_llm_cols: bool = True,
+    ):
         github_username, github_token = utils.get_github_settings(settings_filepath)
 
         self.session = requests.Session()
@@ -34,26 +179,64 @@ class GitHubFileExtractor:
 
         self.table_dir = table_dir
         self.topics = []
+        self.filter_license = filter_license
+        self.filter_llm_cols = filter_llm_cols
+
+        os.makedirs(log_filepath, exist_ok=True)
 
         logging_filepath = f"{log_filepath}/extraction_logfile.log"
         if not os.path.exists(logging_filepath):
-            open(logging_filepath, "w+")
+            open(logging_filepath, "w+").close()
 
         logging.basicConfig(filename=logging_filepath, filemode="a", level=logging.INFO)
         self._logger = logging.getLogger()
+
+    # ── License helpers ────────────────────────────────────────────────────────
+
+    def _get_repo_license(self, repo_full_name: str) -> Optional[str]:
+        """Return the SPDX license key for a repo, or None if unlicensed / unknown.
+
+        Parameters
+        ----------
+        repo_full_name
+            GitHub repo in ``owner/repo`` format.
+        """
+        url = f"https://api.github.com/repos/{repo_full_name}/license"
+        try:
+            response = self.session.get(url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("license", {}).get("spdx_id", "").lower() or None
+            # 404 → no license file in repo
+        except Exception as exc:
+            self._logger.warning("Could not fetch license for %s: %s", repo_full_name, exc)
+        return None
+
+    def _repo_has_research_license(self, repo_full_name: str) -> bool:
+        """Return True only when the repo carries a research-friendly license."""
+        spdx = self._get_repo_license(repo_full_name)
+        if spdx is None:
+            return False
+        return spdx in RESEARCH_FRIENDLY_LICENSES
+
+    # ── Topic setup (unchanged from original) ─────────────────────────────────
 
     def set_topics(self, custom_topics: list = None):
         """Get topics from WordNet to extract GitHub tables.
         CSV files will be searched on GitHub based on these topics.
         """
+        os.makedirs(self.table_dir, exist_ok=True)
+
         topics_filepath = f"{self.table_dir}/github_topics.txt"
+        topic_list = []
+
         if custom_topics is not None:
             topic_list = custom_topics
             self.topics = topic_list
             self._write_topics_to_file(topic_list, topics_filepath)
         else:
             if not os.path.exists(topics_filepath):
-                synsets = pd.Series(list(wn.all_synsets("n"))).unique().tolist()
+                synsets = list(set(list(wn.all_synsets("n"))))
 
                 for synset in synsets:
                     lemma = synset.lemma_names()[0]
@@ -84,6 +267,8 @@ class GitHubFileExtractor:
         filepath
             Filepath to write the topics to.
         """
+        if not os.path.exists(filepath):
+            open(filepath, "w+").close()
         with open(filepath, "w+") as topic_file:
             self.topics = topic_list
             json.dump(topic_list, topic_file)
@@ -113,9 +298,9 @@ class GitHubFileExtractor:
                     "Extracting CSVs from #topic %s: %s", num_topic, topic
                 )
 
-                raw_urls, urls = self._get_raw_file_urls_from_response(topic, topic_dir)
+                raw_urls, urls, repo_names = self._get_raw_file_urls_from_response(topic, topic_dir)
                 num_topic_csvs = self._write_url_contents_to_csv_files(
-                    topic_dir, raw_urls, urls
+                    topic_dir, raw_urls, urls, repo_names
                 )
 
                 num_csvs = num_csvs + num_topic_csvs
@@ -154,9 +339,12 @@ class GitHubFileExtractor:
         # At most 100 per page can be retrieved per request.
         raw_urls = []
         urls = []
+        repo_names = []
 
         query = f"https://api.github.com/search/code?q={topic}+in:file+extension:csv&per_page=100"
+        self._search_throttle()
         response = self.session.get(query)
+
         if response.status_code == 200:
 
             response_limit = 1000
@@ -168,10 +356,12 @@ class GitHubFileExtractor:
             self._write_github_metadata(topic_query_metadata, "a")
 
             if url_count > response_limit:
-                raw_urls, urls = self._segment_query(topic, topic_dir, url_count, raw_urls, urls)
+                raw_urls, urls, repo_names = self._segment_query(
+                    topic, topic_dir, url_count, raw_urls, urls, repo_names
+                )
             else:
-                raw_urls, urls = self._traverse_through_url_pages(
-                    response, topic_dir, raw_urls, urls
+                raw_urls, urls, repo_names = self._traverse_through_url_pages(
+                    response, topic_dir, raw_urls, urls, repo_names
                 )
             num_raw_urls = len(raw_urls)
             raw_url_msg = f"Retrieved {num_raw_urls} raw urls for topic {topic}."
@@ -181,7 +371,7 @@ class GitHubFileExtractor:
             self._logger.info(response.json())
             self._log_response_and_wait(response)
 
-        return raw_urls, urls
+        return raw_urls, urls, repo_names
 
     def _generate_size_sequence(
         self, lower_quartile: float, upper_quartile: float, total_count: int
@@ -206,7 +396,7 @@ class GitHubFileExtractor:
 
         return size_sequence, step_size
 
-    def _segment_query(self, topic: str, topic_dir: str, url_count: int, raw_urls: list, urls: list):
+    def _segment_query(self, topic, topic_dir, url_count, raw_urls, urls, repo_names):
         """Segment the query into queries that are expected to yield less urls than the limit.
 
         topic
@@ -246,13 +436,12 @@ class GitHubFileExtractor:
                     f"{lower_size_limit}..{upper_size_limit}+extension:csv"
                     "&per_page=100"
                 )
-
+                self._search_throttle()
                 response = self.session.get(segmented_query)
                 if response.status_code == 200:
-                    # responses.append(response)
                     url_counts.append(response.json()["total_count"])
-                    raw_urls, urls = self._traverse_through_url_pages(
-                        response, topic_dir, raw_urls, urls
+                    raw_urls, urls, repo_names = self._traverse_through_url_pages(
+                        response, topic_dir, raw_urls, urls, repo_names
                     )
                 else:
                     self._logger.info(response.json())
@@ -277,10 +466,10 @@ class GitHubFileExtractor:
             step_sizes,
         )
 
-        return raw_urls, urls
+        return raw_urls, urls, repo_names
 
     def _traverse_through_url_pages(
-        self, response, topic_dir: str, raw_urls: list, urls: list
+        self, response, topic_dir: str, raw_urls: list, urls: list, repo_names
     ):
         """Traverse through response page by page to extract urls.
 
@@ -297,17 +486,18 @@ class GitHubFileExtractor:
             request_url = response.request.url
             topic_metadata_file.write(request_url + "\n")
 
-        raw_urls, urls = self._add_urls_from_response(response, raw_urls, urls)
-        while "next" in response.links.keys():
+        raw_urls, urls, repo_names = self._add_urls_from_response(response, raw_urls, urls, repo_names)
+        while "next" in response.links:
             try:
                 old_response = response
+                self._search_throttle()
                 # The response captures only the 'last' link hence should be overwritten.
                 response = self.session.get(
                     response.links["next"]["url"],
                 )
                 if response.status_code == 200:
-                    raw_urls, urls = self._add_urls_from_response(
-                        response, raw_urls, urls
+                    raw_urls, urls, repo_names = self._add_urls_from_response(
+                        response, raw_urls, urls, repo_names
                     )
                 else:
                     self._log_response_and_wait(response)
@@ -319,9 +509,26 @@ class GitHubFileExtractor:
                 )
                 continue
 
-        return raw_urls, urls
+        return raw_urls, urls, repo_names
 
-    def _add_urls_from_response(self, response, raw_urls, urls):
+    @staticmethod
+    def _to_raw_url(html_url: str) -> str:
+        """Convert a GitHub blob URL to a raw.githubusercontent.com URL.
+
+        Example:
+          https://github.com/owner/repo/blob/abc123/path/file.csv
+          → https://raw.githubusercontent.com/owner/repo/abc123/path/file.csv
+
+        This avoids the ?raw=true redirect through the web UI, which is
+        aggressively rate-limited for programmatic access.
+        """
+        return (
+            html_url
+            .replace("https://github.com/", "https://raw.githubusercontent.com/")
+            .replace("/blob/", "/")
+        )
+
+    def _add_urls_from_response(self, response, raw_urls, urls, repo_names):
         """Extract urls (raw and plain) from response and add to existing lists.
 
         response
@@ -332,13 +539,13 @@ class GitHubFileExtractor:
             List of urls.
         """
         items = response.json()["items"]
-        raw_urls = raw_urls + [item["html_url"] + "?raw=true" for item in items]
-        urls = urls + [item["html_url"] for item in items]
-
-        return raw_urls, urls
+        raw_urls   += [self._to_raw_url(item["html_url"]) for item in items]
+        urls       += [item["html_url"] for item in items]
+        repo_names += [item["repository"]["full_name"] for item in items]
+        return raw_urls, urls, repo_names
 
     def _write_url_contents_to_csv_files(
-        self, topic_dir: str, raw_urls: list, urls: list
+        self, topic_dir: str, raw_urls: list, urls: list, repo_names: list
     ):
         """Extract raw contents from GitHub URLs and write to CSV files.
 
@@ -353,83 +560,196 @@ class GitHubFileExtractor:
             URLs to file on GitHub for later reference.
         """
         topic_tables_dir = f"{topic_dir}/csv_files"
-        if not os.path.exists(topic_tables_dir):
-            os.makedirs(topic_tables_dir)
+        os.makedirs(topic_tables_dir, exist_ok=True)
 
         start = time.time()
         num_csvs = 0
+
+        # Cache license lookups so each repo is only queried once per session.
+        license_cache: Dict[str, bool] = {}
+
+        skipped_license = 0
+        skipped_llm = 0
+
         for num_raw_url, raw_url in enumerate(raw_urls):
             try:
                 url = urls[num_raw_url]
+                repo_full_name = repo_names[num_raw_url]
+
+                # ── 1. License filter ──────────────────────────────────────
+                if self.filter_license:
+                    if repo_full_name not in license_cache:
+                        license_cache[repo_full_name] = self._repo_has_research_license(
+                            repo_full_name
+                        )
+                    if not license_cache[repo_full_name]:
+                        skipped_license += 1
+                        self._logger.debug(
+                            "Skipped (license) repo %s", repo_full_name
+                        )
+                        continue
+
+                # ── 2. Download with exponential backoff ───────────────────
+                raw_content = self._fetch_with_retry(raw_url)
+                if raw_content is None:
+                    self._logger.warning("Giving up on %s after retries.", url)
+                    continue
+
+                # ── 3. LLM-column filter ───────────────────────────────────
+                if self.filter_llm_cols and _is_llm_csv(raw_content):
+                    skipped_llm += 1
+                    self._logger.debug("Skipped (LLM cols) %s", url)
+                    continue
+
+                # ── 4. Persist ─────────────────────────────────────────────
                 file_name = url.split("/")[-1]
                 file_path = os.path.join(topic_tables_dir, file_name)
 
                 if os.path.exists(file_path):
-                    file_name_wo_extension = file_name.split(".csv")[0]
-                    filename_count = len(
-                        glob.glob1(
-                            topic_tables_dir, f"{file_name_wo_extension}*.csv"
-                        )
-                    )
-                    file_name = (
-                        file_name_wo_extension + "_" + str(filename_count) + ".csv"
-                    )
+                    stem = file_name.split(".csv")[0]
+                    count = len(glob.glob1(topic_tables_dir, f"{stem}*.csv"))
+                    file_name = f"{stem}_{count}.csv"
                     file_path = os.path.join(topic_tables_dir, file_name)
 
-                response = self.session.get(raw_url)
-                if response.status_code == 200:
+                with open(file_path, "wb+") as content_file:
+                    content_file.write(raw_content)
 
-                    raw_content = response.content
+                with open(f"{topic_dir}/topic_csv_urls.txt", "a") as f:
+                    f.write(url + "\n")
 
-                    with open(file_path, "wb+") as content_file:
-                        content_file.write(raw_content)
-                        content_file.close()
+                num_csvs += 1
 
-                    with open(f"{topic_dir}/topic_csv_urls.txt", "a") as topic_metadata_file:
-                        topic_metadata_file.write(url + "\n")
+                if num_csvs % 2500 == 0:
+                    elapsed = time.time() - start
+                    self._logger.info(
+                        "Saved %s CSVs in %.1f s (skipped: %s no-license, %s llm-cols).",
+                        num_csvs, elapsed, skipped_license, skipped_llm,
+                    )
 
-                    num_csvs += 1
-
-                    if num_csvs % 2500 == 0:
-                        end = time.time()
-                        self._logger.info(
-                            "Reading the content from %s urls took %s seconds.",
-                            num_csvs,
-                            end - start,
-                        )
-
-                else:
-                    self._log_response_and_wait(response)
-                    self._logger.info(response.json())
-            except Exception as exception:
+            except Exception as exc:
                 self._logger.error(
-                    "Error messsage for writing content of url #%s to file: %s",
-                    num_raw_url,
-                    exception,
+                    "Error writing content of url #%s: %s", num_raw_url, exc
                 )
                 continue
 
+        self._logger.info(
+            "Topic done — saved %s CSVs, skipped %s (license), %s (LLM columns).",
+            num_csvs, skipped_license, skipped_llm,
+        )
         return num_csvs
 
-    def _log_response_and_wait(self, response):
-        """Log the response status code and repeat the request after the set time.
+    def _fetch_with_retry(self, url: str, max_retries: int = 5) -> Optional[bytes]:
+        """GET a URL and return the raw bytes, retrying on 429/403 with exponential backoff.
 
-        response
-            response from GitHub API.
+        Returns None if all retries are exhausted.
+
+        Backoff schedule (seconds): 60, 120, 240, 480, 960
+        This handles the headerless 429s GitHub's CDN sends for raw file downloads.
+        """
+        for attempt in range(max_retries):
+            response = self.session.get(url)
+            if response.status_code == 200:
+                return response.content
+
+            if response.status_code in (429, 403):
+                backoff = 60 * (2 ** attempt)   # 60 → 120 → 240 → 480 → 960
+                headers = response.headers
+
+                # Prefer the reset-epoch header if present
+                if "X-RateLimit-Reset" in headers:
+                    try:
+                        reset_at = float(headers["X-RateLimit-Reset"])
+                        backoff  = max(backoff, reset_at - time.time() + 5)
+                    except ValueError:
+                        pass
+
+                backoff = min(backoff, 1200.0)  # cap at 20 min
+                self._logger.error(
+                    "Download rate-limited (%s) on attempt %d/%d for %s — "
+                    "backing off %.0f s.",
+                    response.status_code, attempt + 1, max_retries, url, backoff,
+                )
+                time.sleep(backoff)
+            else:
+                # Non-retryable error (404, 500, …)
+                self._logger.warning(
+                    "Non-retryable status %s for %s.", response.status_code, url
+                )
+                return None
+
+        self._logger.error("Exhausted %d retries for %s.", max_retries, url)
+        return None
+    # Enforce a minimum 6.5 s gap between search calls to stay under the ceiling
+    # proactively, without relying solely on 429 reactions.
+    _SEARCH_MIN_INTERVAL: float = 6.5   # seconds between consecutive search requests
+    _last_search_ts: float = 0.0        # timestamp of the last search request
+
+    def _search_throttle(self) -> None:
+        """Block until it is safe to fire the next code-search request.
+
+        Enforces a minimum inter-request gap so we stay under the 10 req/min
+        ceiling without needing to react to 429s.
+        """
+        elapsed = time.time() - self._last_search_ts
+        gap = self._SEARCH_MIN_INTERVAL - elapsed
+        if gap > 0:
+            self._logger.debug("Rate-limit throttle: sleeping %.2f s", gap)
+            time.sleep(gap)
+        self._last_search_ts = time.time()
+
+    def _log_response_and_wait(self, response) -> None:
+        """Log a non-200 response and sleep until it is safe to retry.
+
+        Decision tree for wait time:
+        1. ``Retry-After`` header      — seconds to wait (GitHub sets this on 429)
+        2. ``X-RateLimit-Reset`` header — absolute UTC epoch when the window reopens;
+                                          we sleep until that moment + 5 s buffer.
+                                          Your 403 logs show this value is always present
+                                          and correctly marks the next-minute boundary.
+        3. Status-code fallback        — 403 → 65 s (just over one minute window),
+                                          429 → 90 s,  anything else → 60 s.
         """
         headers = response.headers
-        if "Retry-After" in headers:
-            wait_time = int(headers["Retry-After"])
-        if "X-RateLimit-Reset" in headers:
-            # Overwrite waiting time if the rate limit was hit.
-            wait_time = int(headers["X-RateLimit-Reset"]) - time.time()
-        else:
-            wait_time = 60
+        status  = response.status_code
 
-        wait_time = max([0, wait_time])
+        wait_time: float
+
+        if "Retry-After" in headers:
+            try:
+                wait_time = float(headers["Retry-After"]) + 2
+            except ValueError:
+                wait_time = 65.0
+
+        elif "X-RateLimit-Reset" in headers:
+            try:
+                reset_at  = float(headers["X-RateLimit-Reset"])
+                # Sleep until the reset epoch, plus a 5-second safety buffer.
+                wait_time = max(0.0, reset_at - time.time()) + 5
+            except ValueError:
+                wait_time = 65.0
+
+        else:
+            # No headers — GitHub CDN 429 on raw file downloads falls here.
+            # Use exponential-backoff-style defaults per status code.
+            if status == 403:
+                wait_time = 65.0
+            elif status == 429:
+                wait_time = 90.0
+            else:
+                wait_time = 60.0
+
+        # Hard clamp: never less than 10 s, never more than 20 min.
+        wait_time = max(10.0, min(wait_time, 1200.0))
 
         self._logger.error(
-            "Received response code %s will wait %s s.", response.status_code, wait_time
+            "Received response code %s — waiting %.0f s before retrying. "
+            "(Retry-After=%s, X-RateLimit-Reset=%s)",
+            status,
+            wait_time,
+            headers.get("Retry-After", "n/a"),
+            headers.get("X-RateLimit-Reset", "n/a"),
         )
-
         time.sleep(wait_time)
+        # Reset the search-throttle clock so the very next search request
+        # is not additionally delayed after already waiting for the window.
+        self._last_search_ts = 0.0
