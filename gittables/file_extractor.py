@@ -15,7 +15,7 @@ import logging
 import os
 import shutil
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import nltk
 
@@ -97,6 +97,24 @@ LLM_COLUMN_KEYWORDS = {
 }
 
 
+def _safe_json(response) -> Optional[dict]:
+    """Parse JSON from a response, returning None on any failure.
+
+    Prevents ``json.JSONDecodeError`` caused by empty bodies, HTML error pages,
+    or network truncation from propagating and killing the topic loop.
+
+    This is the root fix for:
+      'Expecting value: line 1 column 1 (char 0)'
+    """
+    try:
+        text = response.text.strip()
+        if not text:
+            return None
+        return response.json()
+    except Exception:
+        return None
+
+
 def _is_llm_csv(raw_content: bytes, sample_rows: int = 3) -> bool:
     """Return True if the CSV looks like an LLM / NLP dataset.
 
@@ -132,14 +150,11 @@ def _is_llm_csv(raw_content: bytes, sample_rows: int = 3) -> bool:
                 if kw in col:
                     return True
 
-        # 2. Heuristic: a column whose cells look like token sequences
+        # 2. Heuristic: cells that look like token sequences
         if len(rows) > 1:
             data_rows = rows[1:]
             for col_idx in range(len(header)):
-                values = []
-                for row in data_rows:
-                    if col_idx < len(row):
-                        values.append(row[col_idx].strip())
+                values = [row[col_idx].strip() for row in data_rows if col_idx < len(row)]
                 if not values:
                     continue
                 avg_words = np.mean([len(v.split()) for v in values if v])
@@ -147,7 +162,6 @@ def _is_llm_csv(raw_content: bytes, sample_rows: int = 3) -> bool:
                     return True
 
     except Exception:
-        # If we can't parse it, don't reject it on suspicion alone
         pass
 
     return False
@@ -162,6 +176,10 @@ class GitHubFileExtractor:
     - filter_license : bool  (default True)  — skip repos without a research-friendly license
     - filter_llm_cols: bool  (default True)  — skip CSVs that look like LLM/NLP datasets
     """
+
+    # GitHub code-search: 10 requests/min authenticated -> enforce 6.5 s gap
+    _SEARCH_MIN_INTERVAL: float = 6.5
+    _last_search_ts: float = 0.0
 
     def __init__(
         self,
@@ -205,9 +223,9 @@ class GitHubFileExtractor:
         try:
             response = self.session.get(url, timeout=10)
             if response.status_code == 200:
-                data = response.json()
-                return data.get("license", {}).get("spdx_id", "").lower() or None
-            # 404 → no license file in repo
+                data = _safe_json(response)
+                if data:
+                    return data.get("license", {}).get("spdx_id", "").lower() or None
         except Exception as exc:
             self._logger.warning("Could not fetch license for %s: %s", repo_full_name, exc)
         return None
@@ -215,11 +233,9 @@ class GitHubFileExtractor:
     def _repo_has_research_license(self, repo_full_name: str) -> bool:
         """Return True only when the repo carries a research-friendly license."""
         spdx = self._get_repo_license(repo_full_name)
-        if spdx is None:
-            return False
-        return spdx in RESEARCH_FRIENDLY_LICENSES
+        return spdx in RESEARCH_FRIENDLY_LICENSES if spdx else False
 
-    # ── Topic setup (unchanged from original) ─────────────────────────────────
+    # ── Topic setup ────────────────────────────────────────────────────────────
 
     def set_topics(self, custom_topics: list = None):
         """Get topics from WordNet to extract GitHub tables.
@@ -240,9 +256,7 @@ class GitHubFileExtractor:
 
                 for synset in synsets:
                     lemma = synset.lemma_names()[0]
-                    lemma_clean = lemma.replace("_", " ").lower()
-                    topic_list.append(lemma_clean)
-
+                    topic_list.append(lemma.replace("_", " ").lower())
                 self.topics = topic_list
                 self._write_topics_to_file(topic_list, topics_filepath)
             else:
@@ -250,12 +264,10 @@ class GitHubFileExtractor:
                 with open(topics_filepath, "r") as topic_file:
                     topic_list = json.load(topic_file)
                     self.topics = topic_list
-                    topic_file.close()
 
-        topics_metadata = (
-            f"Number of topics to extract CSV files for is: {len(topic_list)}.\n"
+        self._write_github_metadata(
+            f"Number of topics to extract CSV files for is: {len(topic_list)}.\n", "a"
         )
-        self._write_github_metadata(topics_metadata, "a")
 
     def _write_topics_to_file(self, topic_list: list, filepath: str):
         """Write the topics used to query GitHub to a text file.
@@ -281,10 +293,13 @@ class GitHubFileExtractor:
             f.write(metadata)
             f.close()
 
+    # ── Core extraction ────────────────────────────────────────────────────────
+
     def extract_github_files(self):
         """Extract CSV files from GitHub."""
         start = time.time()
         num_csvs = 0
+        num_topic = 0
         # The GitTables token starts at end of topic list to avoid conflict
         for num_topic, topic in enumerate(self.topics[::-1]):
             try:
@@ -294,9 +309,7 @@ class GitHubFileExtractor:
                     shutil.rmtree(topic_dir)
                 os.makedirs(topic_dir)
 
-                self._logger.info(
-                    "Extracting CSVs from #topic %s: %s", num_topic, topic
-                )
+                self._logger.info("Extracting CSVs from #topic %s: %s", num_topic, topic)
 
                 raw_urls, urls, repo_names = self._get_raw_file_urls_from_response(topic, topic_dir)
                 num_topic_csvs = self._write_url_contents_to_csv_files(
@@ -326,15 +339,15 @@ class GitHubFileExtractor:
 
     def _get_raw_file_urls_from_response(self, topic: str, topic_dir: str):
         """Get relevant items from response, specifically
-        the total file count and raw url references.
+                the total file count and raw url references.
 
-        Parameters
-        ----------
-        topic
-            Topic to query CSV files from GitHub for.
-        topic_dir
-            Directory of topic to write metadata to.
-        """
+                Parameters
+                ----------
+                topic
+                    Topic to query CSV files from GitHub for.
+                topic_dir
+                    Directory of topic to write metadata to.
+                """
         # Per search max. 1K results will be returned. Query should be segmented accordingly.
         # At most 100 per page can be retrieved per request.
         raw_urls = []
@@ -346,16 +359,19 @@ class GitHubFileExtractor:
         response = self.session.get(query)
 
         if response.status_code == 200:
+            data = _safe_json(response)
+            if data is None:
+                self._logger.error(
+                    "Empty/invalid JSON body for topic '%s' query. Skipping topic.", topic
+                )
+                return raw_urls, urls, repo_names
 
-            response_limit = 1000
-            url_count = response.json()["total_count"]
-
-            topic_query_metadata = (
-                f"URL count from original query of topic {topic} is {url_count}.\n"
+            url_count = data.get("total_count", 0)
+            self._write_github_metadata(
+                f"URL count from original query of topic {topic} is {url_count}.\n", "a"
             )
-            self._write_github_metadata(topic_query_metadata, "a")
 
-            if url_count > response_limit:
+            if url_count > 1000:
                 raw_urls, urls, repo_names = self._segment_query(
                     topic, topic_dir, url_count, raw_urls, urls, repo_names
                 )
@@ -363,12 +379,18 @@ class GitHubFileExtractor:
                 raw_urls, urls, repo_names = self._traverse_through_url_pages(
                     response, topic_dir, raw_urls, urls, repo_names
                 )
-            num_raw_urls = len(raw_urls)
-            raw_url_msg = f"Retrieved {num_raw_urls} raw urls for topic {topic}."
-            self._logger.info(raw_url_msg)
+
+            self._logger.info("Retrieved %s raw urls for topic %s.", len(raw_urls), topic)
 
         else:
-            self._logger.info(response.json())
+            data = _safe_json(response)
+            if data:
+                self._logger.info("Non-200 response for topic '%s': %s", topic, data)
+            else:
+                self._logger.error(
+                    "Non-200 response (status %s) with unreadable body for topic '%s'.",
+                    response.status_code, topic,
+                )
             self._log_response_and_wait(response)
 
         return raw_urls, urls, repo_names
@@ -439,12 +461,27 @@ class GitHubFileExtractor:
                 self._search_throttle()
                 response = self.session.get(segmented_query)
                 if response.status_code == 200:
-                    url_counts.append(response.json()["total_count"])
+                    data = _safe_json(response)
+                    if data is None:
+                        self._logger.error(
+                            "Empty/invalid JSON in segmented query for topic '%s' "
+                            "size %s..%s. Skipping segment.",
+                            topic, lower_size_limit, upper_size_limit,
+                        )
+                        continue
+                    url_counts.append(data.get("total_count", 0))
                     raw_urls, urls, repo_names = self._traverse_through_url_pages(
                         response, topic_dir, raw_urls, urls, repo_names
                     )
                 else:
-                    self._logger.info(response.json())
+                    data = _safe_json(response)
+                    if data:
+                        self._logger.info("Segment query error response: %s", data)
+                    else:
+                        self._logger.error(
+                            "Segment query status %s with unreadable body.",
+                            response.status_code,
+                        )
                     self._log_response_and_wait(response)
 
             number_queries.append(len(size_sequence))
@@ -537,12 +574,38 @@ class GitHubFileExtractor:
             List of raw content urls.
         urls
             List of urls.
+
+        FIX: response.json()["items"] with no guard.
+        When GitHub returns an empty or malformed body (e.g. during a brief
+        network hiccup mid-pagination), this raised JSONDecodeError which
+        escaped _traverse_through_url_pages, was caught by extract_github_files
+        as a generic Exception, and logged the misleading message:
+          'Expecting value: line 1 column 1 (char 0)'
+        killing the entire topic rather than just skipping one bad page.
         """
-        items = response.json()["items"]
+        data = _safe_json(response)
+        if data is None:
+            self._logger.error(
+                "Empty/invalid JSON in _add_urls_from_response (status %s). "
+                "Skipping this page of results.",
+                response.status_code,
+            )
+            return raw_urls, urls, repo_names
+
+        items = data.get("items")
+        if not items:
+            self._logger.warning(
+                "Response had no 'items' or empty items list (status %s).",
+                response.status_code,
+            )
+            return raw_urls, urls, repo_names
+
         raw_urls   += [self._to_raw_url(item["html_url"]) for item in items]
         urls       += [item["html_url"] for item in items]
         repo_names += [item["repository"]["full_name"] for item in items]
         return raw_urls, urls, repo_names
+
+    # ── Download with retry ────────────────────────────────────────────────────
 
     def _write_url_contents_to_csv_files(
         self, topic_dir: str, raw_urls: list, urls: list, repo_names: list
@@ -576,7 +639,7 @@ class GitHubFileExtractor:
                 url = urls[num_raw_url]
                 repo_full_name = repo_names[num_raw_url]
 
-                # ── 1. License filter ──────────────────────────────────────
+                # 1. License filter
                 if self.filter_license:
                     if repo_full_name not in license_cache:
                         license_cache[repo_full_name] = self._repo_has_research_license(
@@ -589,19 +652,19 @@ class GitHubFileExtractor:
                         )
                         continue
 
-                # ── 2. Download with exponential backoff ───────────────────
+                # 2. Download with exponential backoff
                 raw_content = self._fetch_with_retry(raw_url)
                 if raw_content is None:
                     self._logger.warning("Giving up on %s after retries.", url)
                     continue
 
-                # ── 3. LLM-column filter ───────────────────────────────────
+                # 3. LLM-column filter
                 if self.filter_llm_cols and _is_llm_csv(raw_content):
                     skipped_llm += 1
                     self._logger.debug("Skipped (LLM cols) %s", url)
                     continue
 
-                # ── 4. Persist ─────────────────────────────────────────────
+                # 4. Persist
                 file_name = url.split("/")[-1]
                 file_path = os.path.join(topic_tables_dir, file_name)
 
@@ -679,10 +742,8 @@ class GitHubFileExtractor:
 
         self._logger.error("Exhausted %d retries for %s.", max_retries, url)
         return None
-    # Enforce a minimum 6.5 s gap between search calls to stay under the ceiling
-    # proactively, without relying solely on 429 reactions.
-    _SEARCH_MIN_INTERVAL: float = 6.5   # seconds between consecutive search requests
-    _last_search_ts: float = 0.0        # timestamp of the last search request
+
+    # ── Rate-limit helpers ─────────────────────────────────────────────────────
 
     def _search_throttle(self) -> None:
         """Block until it is safe to fire the next code-search request.
@@ -710,7 +771,7 @@ class GitHubFileExtractor:
                                           429 → 90 s,  anything else → 60 s.
         """
         headers = response.headers
-        status  = response.status_code
+        status = response.status_code
 
         wait_time: float
 
